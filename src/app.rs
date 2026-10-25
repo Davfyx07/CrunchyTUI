@@ -3,8 +3,9 @@
 use std::io::Stdout;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
-use crunchyroll_rs::crunchyroll::SessionToken;
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crunchyroll_rs::auth::SessionToken;
+use crunchyroll_rs::list::{WatchHistoryEntry, WatchlistEntry};
 use crunchyroll_rs::search::SearchSeries;
 use crunchyroll_rs::{Crunchyroll, Episode, Season, Series};
 use futures::StreamExt;
@@ -16,15 +17,15 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::config::Config;
 use crate::errors::AppError;
-use crate::player::PlayRequest;
+use crate::player::PlaybackTarget;
 use crate::ui::anime::AnimeState;
 use crate::ui::episodes::{EpisodesState, PlayPopup};
-use crate::ui::home::HomeState;
+use crate::ui::home::{HomeState, HomeTab};
 use crate::ui::login::LoginState;
 use crate::ui::popup::Popup;
 use crate::ui::search::SearchState;
 use crate::ui::widgets::{list_next, list_prev};
-use crate::{api, player, theme, ui};
+use crate::{api, player, sso, theme, ui};
 
 /// Mensajes de vuelta de las tareas async hacia el loop de la TUI.
 enum AppEvent {
@@ -33,12 +34,21 @@ enum AppEvent {
         remember: bool,
         result: Result<(Crunchyroll, SessionToken), String>,
     },
+    HomeDataDone {
+        history: Result<Vec<WatchHistoryEntry>, String>,
+        watchlist: Result<Vec<WatchlistEntry>, String>,
+    },
+    HomePosterDone(u64, Result<image::DynamicImage, String>),
     SearchFire(u64, String),
     SearchDone(u64, Result<Vec<SearchSeries>, String>),
     PosterDone(u64, Result<image::DynamicImage, String>),
     SeasonsDone(Result<Box<(Series, Vec<Season>)>, String>),
     EpisodesDone(Result<Box<(Season, Vec<Episode>)>, String>),
-    PlayDone(Result<PlayRequest, String>),
+    PlayDone(Result<PlaybackTarget, String>),
+    /// URL de login abierta en el navegador (o error al prepararla).
+    SsoUrl(Result<String, String>),
+    /// URL de retorno `sso.crunchyroll://…` entregada por el navegador.
+    SsoCallback(String),
 }
 
 /// Pantalla activa.
@@ -61,6 +71,7 @@ pub struct App {
     /// Estado de búsqueda conservado al entrar en una serie (para Esc).
     saved_search: Option<SearchState>,
     saved_anime: Option<AnimeState>,
+    saved_home: Option<HomeState>,
     quit: bool,
 }
 
@@ -80,6 +91,7 @@ impl App {
             rx,
             saved_search: None,
             saved_anime: None,
+            saved_home: None,
             quit: false,
         }
     }
@@ -155,20 +167,36 @@ impl App {
     // ----- entrada de teclado ---------------------------------------------
 
     fn handle_terminal_event(&mut self, event: Event) {
-        let Event::Key(key) = event else { return };
-        if key.kind != KeyEventKind::Press {
-            return;
-        }
-        if self.popup.is_some() {
-            self.handle_popup_key(key);
-            return;
-        }
-        match &mut self.screen {
-            Screen::Login(_) => self.login_key(key),
-            Screen::Home(_) => self.home_key(key),
-            Screen::Search(_) => self.search_key(key),
-            Screen::Anime(_) => self.anime_key(key),
-            Screen::Episodes(_) => self.episodes_key(key),
+        match event {
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    return;
+                }
+                if self.popup.is_some() {
+                    self.handle_popup_key(key);
+                    return;
+                }
+                match &mut self.screen {
+                    Screen::Login(_) => self.login_key(key),
+                    Screen::Home(_) => self.home_key(key),
+                    Screen::Search(_) => self.search_key(key),
+                    Screen::Anime(_) => self.anime_key(key),
+                    Screen::Episodes(_) => self.episodes_key(key),
+                }
+            }
+            Event::Paste(text) => {
+                if self.popup.is_none() {
+                    if let Screen::Login(s) = &mut self.screen {
+                        if s.field == 0 {
+                            s.code.push_str(text.trim());
+                        }
+                    } else if let Screen::Search(s) = &mut self.screen {
+                        s.input.push_str(text.trim());
+                        self.trigger_search();
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -187,61 +215,212 @@ impl App {
         let Screen::Login(s) = &mut self.screen else {
             return;
         };
+
+        // Atajos con Ctrl (p. ej. Ctrl+C o Ctrl+V) no son texto.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => self.quit = true,
-            KeyCode::Tab | KeyCode::Down => s.field = (s.field + 1) % 3,
-            KeyCode::BackTab | KeyCode::Up => s.field = (s.field + 2) % 3,
-            KeyCode::Char(' ') if s.field == 2 => s.remember = !s.remember,
-            KeyCode::Char(c) if s.field <= 1 => {
-                if s.field == 0 {
-                    s.email.push(c);
-                } else {
-                    s.password.push(c);
-                }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => s.field ^= 1,
+            KeyCode::Char(' ') if s.field == 1 => s.remember = !s.remember,
+            KeyCode::Char(c) if s.field == 0 => s.code.push(c),
+            KeyCode::Backspace if s.field == 0 => {
+                s.code.pop();
             }
-            KeyCode::Backspace if s.field <= 1 => {
-                if s.field == 0 {
-                    s.email.pop();
-                } else {
-                    s.password.pop();
-                }
-            }
+            KeyCode::Enter if s.code.trim().is_empty() => self.start_sso(),
             KeyCode::Enter => {
-                if s.email.trim().is_empty() || s.password.is_empty() {
-                    self.popup = Some(Popup::Error("Introduce correo y contraseña.".into()));
-                    return;
-                }
-                let (email, password, remember) = (s.email.clone(), s.password.clone(), s.remember);
-                self.popup = Some(Popup::Busy("Iniciando sesión…".into()));
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
-                    let result = api::login(&email, &password).await;
-                    let _ = tx.send(AppEvent::LoginDone {
-                        restore: false,
-                        remember,
-                        result,
-                    });
-                });
+                let input = std::mem::take(&mut s.code);
+                self.submit_sso_code(&input);
             }
             _ => {}
         }
+    }
+
+    /// Abre el login oficial en el navegador y espera su vuelta en segundo plano.
+    fn start_sso(&mut self) {
+        let Screen::Login(s) = &mut self.screen else {
+            return;
+        };
+        if let Some(h) = s.waiting.take() {
+            h.abort();
+        }
+        s.verifier = uuid::Uuid::new_v4().to_string();
+        let verifier = s.verifier.clone();
+        let tx = self.tx.clone();
+        let task = tokio::spawn(async move {
+            if let Err(e) = sso::register_handler() {
+                tracing::warn!("sin manejador sso.crunchyroll:// ({e}); toca pegar el código");
+            }
+            let url = api::sso_url(&verifier).await;
+            if let Ok(u) = &url {
+                tracing::info!("login SSO: {u}");
+                if let Err(e) = sso::open_browser(u) {
+                    tracing::warn!("no se pudo abrir el navegador: {e}");
+                }
+            }
+            let ok = url.is_ok();
+            let _ = tx.send(AppEvent::SsoUrl(url));
+            if ok {
+                if let Some(cb) = sso::wait_callback().await {
+                    let _ = tx.send(AppEvent::SsoCallback(cb));
+                }
+            }
+        });
+        s.waiting = Some(task.abort_handle());
+    }
+
+    /// Canjea el código (o la URL de retorno que lo contiene) por una sesión.
+    fn submit_sso_code(&mut self, input: &str) {
+        let Screen::Login(s) = &mut self.screen else {
+            return;
+        };
+        if s.verifier.is_empty() {
+            self.popup = Some(Popup::Error("Primero pulsa Enter para abrir el navegador.".into()));
+            return;
+        }
+        let Some(code) = api::extract_code(input) else {
+            self.popup = Some(Popup::Error("No encontré el código en lo pegado.".into()));
+            return;
+        };
+        if let Some(h) = s.waiting.take() {
+            h.abort();
+        }
+        let (verifier, remember) = (s.verifier.clone(), s.remember);
+        self.popup = Some(Popup::Busy("Iniciando sesión…".into()));
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = api::login_oauth(&code, &verifier).await;
+            let _ = tx.send(AppEvent::LoginDone {
+                restore: false,
+                remember,
+                result,
+            });
+        });
     }
 
     fn home_key(&mut self, key: KeyEvent) {
         let Screen::Home(s) = &mut self.screen else {
             return;
         };
+
+        if let Some(play) = &mut s.play {
+            match key.code {
+                KeyCode::Esc => s.play = None,
+                KeyCode::Tab | KeyCode::Right => play.focus = (play.focus + 1) % 3,
+                KeyCode::BackTab | KeyCode::Left => play.focus = (play.focus + 2) % 3,
+                KeyCode::Down => match play.focus {
+                    0 => play.audio_sel = (play.audio_sel + 1).min(play.audios.len() - 1),
+                    1 => play.sub_sel = (play.sub_sel + 1).min(play.subs.len() - 1),
+                    _ => {
+                        play.quality_sel =
+                            (play.quality_sel + 1).min(ui::episodes::QUALITIES.len() - 1)
+                    }
+                },
+                KeyCode::Up => match play.focus {
+                    0 => play.audio_sel = play.audio_sel.saturating_sub(1),
+                    1 => play.sub_sel = play.sub_sel.saturating_sub(1),
+                    _ => play.quality_sel = play.quality_sel.saturating_sub(1),
+                },
+                KeyCode::Enter => {
+                    let ep = s.history.get(play.episode_idx).and_then(|entry| {
+                        match &entry.panel {
+                            Some(crunchyroll_rs::MediaCollection::Episode(ep)) => Some(ep.clone()),
+                            _ => None,
+                        }
+                    });
+                    if let Some(ep) = ep {
+                        let version = play.audios[play.audio_sel].1.clone();
+                        let subtitle = play.subs[play.sub_sel].1.clone();
+                        let quality = ui::episodes::QUALITIES[play.quality_sel].to_string();
+                        self.popup = Some(Popup::Busy("Obteniendo stream…".into()));
+                        let tx = self.tx.clone();
+                        tokio::spawn(async move {
+                            let _ = tx.send(AppEvent::PlayDone(
+                                api::resolve_play(ep, version, subtitle, quality).await,
+                            ));
+                        });
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.popup = Some(Popup::Help),
-            KeyCode::Up => s.selected = s.selected.saturating_sub(1),
-            KeyCode::Down => s.selected = (s.selected + 1).min(ui::home::ITEMS.len() - 1),
-            KeyCode::Char('/') | KeyCode::Enter => {
-                let idx = s.selected;
-                if key.code == KeyCode::Enter && idx == 1 {
-                    self.quit = true;
-                } else {
-                    self.screen = Screen::Search(self.saved_search.take().unwrap_or_default());
+            KeyCode::Char('r') => self.load_home_data(),
+            KeyCode::Char('/') => {
+                let prev = std::mem::replace(
+                    &mut self.screen,
+                    Screen::Search(self.saved_search.take().unwrap_or_default()),
+                );
+                if let Screen::Home(h) = prev {
+                    self.saved_home = Some(h);
+                }
+            }
+            KeyCode::Char('1') => {
+                s.tab = HomeTab::History;
+                self.trigger_home_poster();
+            }
+            KeyCode::Char('2') => {
+                s.tab = HomeTab::Watchlist;
+                self.trigger_home_poster();
+            }
+            KeyCode::Tab => {
+                s.tab = match s.tab {
+                    HomeTab::History => HomeTab::Watchlist,
+                    HomeTab::Watchlist => HomeTab::History,
+                };
+                self.trigger_home_poster();
+            }
+            KeyCode::Down => {
+                match s.tab {
+                    HomeTab::History => list_next(&mut s.history_list, s.history.len()),
+                    HomeTab::Watchlist => list_next(&mut s.watchlist_list, s.watchlist.len()),
+                }
+                self.trigger_home_poster();
+            }
+            KeyCode::Up => {
+                match s.tab {
+                    HomeTab::History => list_prev(&mut s.history_list),
+                    HomeTab::Watchlist => list_prev(&mut s.watchlist_list),
+                }
+                self.trigger_home_poster();
+            }
+            KeyCode::Enter => {
+                match s.tab {
+                    HomeTab::History => {
+                        if let Some(idx) = s.history_list.selected() {
+                            if let Some(entry) = s.history.get(idx) {
+                                if let Some(crunchyroll_rs::MediaCollection::Episode(ref ep)) = entry.panel {
+                                    s.play = Some(PlayPopup::new(
+                                        idx,
+                                        ep,
+                                        &self.config.audio,
+                                        &self.config.subtitle,
+                                        &self.config.quality,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    HomeTab::Watchlist => {
+                        if let Some(entry) = s.selected_watchlist() {
+                            if let crunchyroll_rs::MediaCollection::Series(ref series) = entry.panel {
+                                let series = series.clone();
+                                self.popup = Some(Popup::Busy("Cargando serie…".into()));
+                                let tx = self.tx.clone();
+                                tokio::spawn(async move {
+                                    let _ = tx.send(AppEvent::SeasonsDone(
+                                        api::series_seasons(series).await.map(Box::new),
+                                    ));
+                                });
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -250,7 +429,13 @@ impl App {
 
     fn search_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.screen = Screen::Home(HomeState::default()),
+            KeyCode::Esc => {
+                self.screen = match self.saved_home.take() {
+                    Some(home) => Screen::Home(home),
+                    None => Screen::Home(HomeState::default()),
+                };
+                self.trigger_home_poster();
+            }
             KeyCode::Down | KeyCode::Up => {
                 let Screen::Search(s) = &mut self.screen else {
                     return;
@@ -304,7 +489,12 @@ impl App {
                 if let Screen::Anime(state) = prev {
                     self.saved_anime = Some(state);
                 }
-                self.screen = Screen::Search(self.saved_search.take().unwrap_or_default());
+                if let Some(search) = self.saved_search.take() {
+                    self.screen = Screen::Search(search);
+                } else {
+                    self.screen = Screen::Home(self.saved_home.take().unwrap_or_default());
+                    self.trigger_home_poster();
+                }
             }
             KeyCode::Char('?') => self.popup = Some(Popup::Help),
             KeyCode::Down | KeyCode::Up => {
@@ -434,6 +624,38 @@ impl App {
         });
     }
 
+    /// Carga los datos del panel principal (historial y watchlist).
+    fn load_home_data(&mut self) {
+        let Some(cr) = &self.crunchy else { return };
+        if let Screen::Home(s) = &mut self.screen {
+            s.loading = true;
+        }
+        let (tx, cr) = (self.tx.clone(), cr.clone());
+        tokio::spawn(async move {
+            let (history, watchlist) = tokio::join!(
+                api::continue_watching(&cr),
+                api::watchlist(&cr),
+            );
+            let _ = tx.send(AppEvent::HomeDataDone { history, watchlist });
+        });
+    }
+
+    /// Carga la portada del elemento seleccionado en el panel principal.
+    fn trigger_home_poster(&mut self) {
+        let (Some(cr), Screen::Home(s)) = (&self.crunchy, &mut self.screen) else {
+            return;
+        };
+        let Some(url) = s.selected_poster_url() else {
+            s.poster = None;
+            return;
+        };
+        s.poster_gen += 1;
+        let (tx, gen, cr) = (self.tx.clone(), s.poster_gen, cr.clone());
+        tokio::spawn(async move {
+            let _ = tx.send(AppEvent::HomePosterDone(gen, api::poster(&cr, url).await));
+        });
+    }
+
     // ----- eventos async ----------------------------------------------------
 
     fn handle_app_event(&mut self, event: AppEvent) {
@@ -443,6 +665,49 @@ impl App {
                 remember,
                 result,
             } => self.on_login_done(restore, remember, result),
+            AppEvent::SsoUrl(Ok(url)) => {
+                if let Screen::Login(s) = &mut self.screen {
+                    s.url = Some(url);
+                }
+            }
+            AppEvent::SsoUrl(Err(e)) => self.popup = Some(Popup::Error(e)),
+            AppEvent::SsoCallback(url) => self.submit_sso_code(&url),
+            AppEvent::HomeDataDone { history, watchlist } => {
+                let Screen::Home(s) = &mut self.screen else {
+                    return;
+                };
+                s.loading = false;
+                match history {
+                    Ok(h) => {
+                        s.history = h;
+                        if !s.history.is_empty() && s.history_list.selected().is_none() {
+                            s.history_list.select(Some(0));
+                        }
+                    }
+                    Err(e) => tracing::warn!("error cargando historial: {e}"),
+                }
+                match watchlist {
+                    Ok(w) => {
+                        s.watchlist = w;
+                        if !s.watchlist.is_empty() && s.watchlist_list.selected().is_none() {
+                            s.watchlist_list.select(Some(0));
+                        }
+                    }
+                    Err(e) => tracing::warn!("error cargando watchlist: {e}"),
+                }
+                self.trigger_home_poster();
+            }
+            AppEvent::HomePosterDone(gen, result) => {
+                let Screen::Home(s) = &mut self.screen else {
+                    return;
+                };
+                if gen != s.poster_gen {
+                    return;
+                }
+                if let Ok(img) = result {
+                    s.poster = Some(self.picker.new_resize_protocol(img));
+                }
+            }
             AppEvent::SearchFire(gen, query) => {
                 let Screen::Search(s) = &self.screen else {
                     return;
@@ -505,6 +770,8 @@ impl App {
                         );
                         if let Screen::Search(state) = prev {
                             self.saved_search = Some(state);
+                        } else if let Screen::Home(state) = prev {
+                            self.saved_home = Some(state);
                         }
                     }
                     Err(e) => self.popup = Some(Popup::Error(e)),
@@ -529,16 +796,26 @@ impl App {
             AppEvent::PlayDone(result) => {
                 self.popup = None;
                 match result {
-                    Ok(req) => match player::launch(&req) {
-                        Ok(()) => {
-                            if let Screen::Episodes(s) = &mut self.screen {
-                                s.play = None;
+                    Ok(target) => {
+                        let outcome = match &target {
+                            PlaybackTarget::Mpv(req) => player::launch(req)
+                                .map(|_| format!("Reproduciendo en mpv: {}", req.title)),
+                            PlaybackTarget::Browser { url, title } => player::launch_browser(url)
+                                .map(|_| format!("Reproduciendo: {title}")),
+                        };
+                        match outcome {
+                            Ok(msg) => {
+                                if let Screen::Episodes(s) = &mut self.screen {
+                                    s.play = None;
+                                }
+                                if let Screen::Home(s) = &mut self.screen {
+                                    s.play = None;
+                                }
+                                self.popup = Some(Popup::Info(msg));
                             }
-                            self.popup =
-                                Some(Popup::Info(format!("Reproduciendo en mpv: {}", req.title)));
+                            Err(e) => self.popup = Some(Popup::Error(e.to_string())),
                         }
-                        Err(e) => self.popup = Some(Popup::Error(e.to_string())),
-                    },
+                    }
                     Err(e) => self.popup = Some(Popup::Error(e)),
                 }
             }
@@ -564,7 +841,11 @@ impl App {
                 if let Err(e) = self.config.save() {
                     tracing::warn!("no se pudo guardar la config: {e}");
                 }
-                self.screen = Screen::Home(HomeState::default());
+                self.screen = Screen::Home(HomeState {
+                    loading: true,
+                    ..HomeState::default()
+                });
+                self.load_home_data();
             }
             Err(e) => {
                 tracing::warn!("login falló: {e}");

@@ -201,7 +201,7 @@ pub fn draw(f: &mut Frame, s: &mut EpisodesState) {
     }
 }
 
-fn draw_play_popup(f: &mut Frame, play: &PlayPopup) {
+pub fn draw_play_popup(f: &mut Frame, play: &PlayPopup) {
     let area = centered_rect(70, 60, f.area());
     f.render_widget(Clear, area);
     let block = Block::bordered()

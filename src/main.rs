@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod errors;
 mod player;
+mod sso;
 mod theme;
 mod ui;
 
@@ -12,6 +13,7 @@ use std::fs::File;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -42,7 +44,7 @@ fn init_logging() {
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         eprintln!("{info}");
     }));
 }
@@ -50,18 +52,30 @@ fn install_panic_hook() {
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen);
     let _ = terminal.show_cursor();
 }
 
 #[tokio::main]
 async fn main() {
+    // El navegador nos lanza así al terminar el login (ver sso.rs).
+    let args: Vec<String> = std::env::args().collect();
+    if let [_, flag, url] = args.as_slice() {
+        if flag == "--sso-callback" {
+            if let Err(e) = sso::write_callback(url) {
+                eprintln!("No se pudo entregar el login a CrunchyTUI: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
+
     init_logging();
     install_panic_hook();
 
