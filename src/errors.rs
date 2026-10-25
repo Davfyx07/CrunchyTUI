@@ -15,4 +15,6 @@ pub enum AppError {
     NoConfigDir,
     #[error("no se pudo lanzar mpv: {0}")]
     Mpv(String),
+    #[error("no se pudo abrir el navegador: {0}")]
+    Browser(String),
 }
