@@ -3,8 +3,8 @@
 use std::io::Stdout;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
-use crunchyroll_rs::crunchyroll::SessionToken;
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crunchyroll_rs::auth::SessionToken;
 use crunchyroll_rs::list::{WatchHistoryEntry, WatchlistEntry};
 use crunchyroll_rs::search::SearchSeries;
 use crunchyroll_rs::{Crunchyroll, Episode, Season, Series};
@@ -25,7 +25,7 @@ use crate::ui::login::LoginState;
 use crate::ui::popup::Popup;
 use crate::ui::search::SearchState;
 use crate::ui::widgets::{list_next, list_prev};
-use crate::{api, player, theme, ui};
+use crate::{api, player, sso, theme, ui};
 
 /// Mensajes de vuelta de las tareas async hacia el loop de la TUI.
 enum AppEvent {
@@ -45,6 +45,10 @@ enum AppEvent {
     SeasonsDone(Result<Box<(Series, Vec<Season>)>, String>),
     EpisodesDone(Result<Box<(Season, Vec<Episode>)>, String>),
     PlayDone(Result<PlaybackTarget, String>),
+    /// URL de login abierta en el navegador (o error al prepararla).
+    SsoUrl(Result<String, String>),
+    /// URL de retorno `sso.crunchyroll://…` entregada por el navegador.
+    SsoCallback(String),
 }
 
 /// Pantalla activa.
@@ -163,20 +167,36 @@ impl App {
     // ----- entrada de teclado ---------------------------------------------
 
     fn handle_terminal_event(&mut self, event: Event) {
-        let Event::Key(key) = event else { return };
-        if key.kind != KeyEventKind::Press {
-            return;
-        }
-        if self.popup.is_some() {
-            self.handle_popup_key(key);
-            return;
-        }
-        match &mut self.screen {
-            Screen::Login(_) => self.login_key(key),
-            Screen::Home(_) => self.home_key(key),
-            Screen::Search(_) => self.search_key(key),
-            Screen::Anime(_) => self.anime_key(key),
-            Screen::Episodes(_) => self.episodes_key(key),
+        match event {
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    return;
+                }
+                if self.popup.is_some() {
+                    self.handle_popup_key(key);
+                    return;
+                }
+                match &mut self.screen {
+                    Screen::Login(_) => self.login_key(key),
+                    Screen::Home(_) => self.home_key(key),
+                    Screen::Search(_) => self.search_key(key),
+                    Screen::Anime(_) => self.anime_key(key),
+                    Screen::Episodes(_) => self.episodes_key(key),
+                }
+            }
+            Event::Paste(text) => {
+                if self.popup.is_none() {
+                    if let Screen::Login(s) = &mut self.screen {
+                        if s.field == 0 {
+                            s.code.push_str(text.trim());
+                        }
+                    } else if let Screen::Search(s) = &mut self.screen {
+                        s.input.push_str(text.trim());
+                        self.trigger_search();
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -195,44 +215,89 @@ impl App {
         let Screen::Login(s) = &mut self.screen else {
             return;
         };
+
+        // Atajos con Ctrl (p. ej. Ctrl+C o Ctrl+V) no son texto.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => self.quit = true,
-            KeyCode::Tab | KeyCode::Down => s.field = (s.field + 1) % 3,
-            KeyCode::BackTab | KeyCode::Up => s.field = (s.field + 2) % 3,
-            KeyCode::Char(' ') if s.field == 2 => s.remember = !s.remember,
-            KeyCode::Char(c) if s.field <= 1 => {
-                if s.field == 0 {
-                    s.email.push(c);
-                } else {
-                    s.password.push(c);
-                }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => s.field ^= 1,
+            KeyCode::Char(' ') if s.field == 1 => s.remember = !s.remember,
+            KeyCode::Char(c) if s.field == 0 => s.code.push(c),
+            KeyCode::Backspace if s.field == 0 => {
+                s.code.pop();
             }
-            KeyCode::Backspace if s.field <= 1 => {
-                if s.field == 0 {
-                    s.email.pop();
-                } else {
-                    s.password.pop();
-                }
-            }
+            KeyCode::Enter if s.code.trim().is_empty() => self.start_sso(),
             KeyCode::Enter => {
-                if s.email.trim().is_empty() || s.password.is_empty() {
-                    self.popup = Some(Popup::Error("Introduce correo y contraseña.".into()));
-                    return;
-                }
-                let (email, password, remember) = (s.email.clone(), s.password.clone(), s.remember);
-                self.popup = Some(Popup::Busy("Iniciando sesión…".into()));
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
-                    let result = api::login(&email, &password).await;
-                    let _ = tx.send(AppEvent::LoginDone {
-                        restore: false,
-                        remember,
-                        result,
-                    });
-                });
+                let input = std::mem::take(&mut s.code);
+                self.submit_sso_code(&input);
             }
             _ => {}
         }
+    }
+
+    /// Abre el login oficial en el navegador y espera su vuelta en segundo plano.
+    fn start_sso(&mut self) {
+        let Screen::Login(s) = &mut self.screen else {
+            return;
+        };
+        if let Some(h) = s.waiting.take() {
+            h.abort();
+        }
+        s.verifier = uuid::Uuid::new_v4().to_string();
+        let verifier = s.verifier.clone();
+        let tx = self.tx.clone();
+        let task = tokio::spawn(async move {
+            if let Err(e) = sso::register_handler() {
+                tracing::warn!("sin manejador sso.crunchyroll:// ({e}); toca pegar el código");
+            }
+            let url = api::sso_url(&verifier).await;
+            if let Ok(u) = &url {
+                tracing::info!("login SSO: {u}");
+                if let Err(e) = sso::open_browser(u) {
+                    tracing::warn!("no se pudo abrir el navegador: {e}");
+                }
+            }
+            let ok = url.is_ok();
+            let _ = tx.send(AppEvent::SsoUrl(url));
+            if ok {
+                if let Some(cb) = sso::wait_callback().await {
+                    let _ = tx.send(AppEvent::SsoCallback(cb));
+                }
+            }
+        });
+        s.waiting = Some(task.abort_handle());
+    }
+
+    /// Canjea el código (o la URL de retorno que lo contiene) por una sesión.
+    fn submit_sso_code(&mut self, input: &str) {
+        let Screen::Login(s) = &mut self.screen else {
+            return;
+        };
+        if s.verifier.is_empty() {
+            self.popup = Some(Popup::Error("Primero pulsa Enter para abrir el navegador.".into()));
+            return;
+        }
+        let Some(code) = api::extract_code(input) else {
+            self.popup = Some(Popup::Error("No encontré el código en lo pegado.".into()));
+            return;
+        };
+        if let Some(h) = s.waiting.take() {
+            h.abort();
+        }
+        let (verifier, remember) = (s.verifier.clone(), s.remember);
+        self.popup = Some(Popup::Busy("Iniciando sesión…".into()));
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = api::login_oauth(&code, &verifier).await;
+            let _ = tx.send(AppEvent::LoginDone {
+                restore: false,
+                remember,
+                result,
+            });
+        });
     }
 
     fn home_key(&mut self, key: KeyEvent) {
@@ -600,6 +665,13 @@ impl App {
                 remember,
                 result,
             } => self.on_login_done(restore, remember, result),
+            AppEvent::SsoUrl(Ok(url)) => {
+                if let Screen::Login(s) = &mut self.screen {
+                    s.url = Some(url);
+                }
+            }
+            AppEvent::SsoUrl(Err(e)) => self.popup = Some(Popup::Error(e)),
+            AppEvent::SsoCallback(url) => self.submit_sso_code(&url),
             AppEvent::HomeDataDone { history, watchlist } => {
                 let Screen::Home(s) = &mut self.screen else {
                     return;

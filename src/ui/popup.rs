@@ -34,27 +34,29 @@ const HELP_LINES: &[&str] = &[
     "ahí las letras no son atajos.",
 ];
 
+/// Un `\n` dentro de un `Line` llega crudo a la terminal y descuadra la UI:
+/// cada línea del mensaje va en su propio `Line`.
+fn body(msg: &str, close_hint: bool) -> Vec<Line<'_>> {
+    let mut lines = vec![Line::from("")];
+    lines.extend(msg.lines().map(Line::from));
+    if close_hint {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Esc / Enter para cerrar", theme::dim())));
+    }
+    lines
+}
+
 pub fn draw(f: &mut Frame, popup: &Popup) {
     let (title, color, lines): (&str, ratatui::style::Color, Vec<Line>) = match popup {
         Popup::Error(msg) => (
             " Error ",
             theme::RED,
-            vec![
-                Line::from(""),
-                Line::from(msg.as_str()),
-                Line::from(""),
-                Line::from(Span::styled("Esc / Enter para cerrar", theme::dim())),
-            ],
+            body(msg, true),
         ),
         Popup::Info(msg) => (
             " Info ",
             theme::ORANGE,
-            vec![
-                Line::from(""),
-                Line::from(msg.as_str()),
-                Line::from(""),
-                Line::from(Span::styled("Esc / Enter para cerrar", theme::dim())),
-            ],
+            body(msg, true),
         ),
         Popup::Help => (
             " Ayuda ",
@@ -64,7 +66,7 @@ pub fn draw(f: &mut Frame, popup: &Popup) {
         Popup::Busy(msg) => (
             " Cargando ",
             theme::PURPLE,
-            vec![Line::from(""), Line::from(msg.as_str())],
+            body(msg, false),
         ),
     };
 

@@ -10,7 +10,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 # chafa-dyn (default) exige libchafa del sistema vía pkg-config; se desactiva
 # para no requerir librerías nativas en NixOS. Sixel/Kitty/halfblocks siguen.
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
-crunchyroll-rs = "0.18"
+crunchyroll-rs = "0.19"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 directories = "6"
@@ -21,3 +21,4 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 futures = "0.3"
 chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }

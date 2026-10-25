@@ -52,6 +52,11 @@ impl Config {
         Ok(dirs()?.data_dir().join("logs"))
     }
 
+    /// Archivo donde `crunchytui --sso-callback <url>` deja la URL de retorno.
+    pub fn sso_callback_path() -> Result<PathBuf, AppError> {
+        Ok(dirs()?.data_dir().join("sso-callback"))
+    }
+
     /// Carga la config; si no existe o es inválida, usa defaults.
     pub fn load() -> Self {
         (|| -> Result<Self, AppError> { Ok(toml::from_str(&fs::read_to_string(Self::path()?)?)?) })(
